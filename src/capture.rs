@@ -14,7 +14,7 @@ pub fn capture_file_name(ts: &DateTime<chrono::Utc>) -> String {
     utc.format("%Y-%m-%dT%H-%M-%S").to_string()
 }
 
-fn decode_entry(capture: &mut Map<String, Value>, key: &str) -> Result<()> {
+fn decode_entry(capture: &mut Map<String, Value>, key: &str, as_sse: bool) -> Result<()> {
     match capture.entry(key) {
         Entry::Vacant(_) => Err(anyhow!("Capture does not have {key} field")),
         Entry::Occupied(mut o) => {
@@ -23,9 +23,13 @@ fn decode_entry(capture: &mut Map<String, Value>, key: &str) -> Result<()> {
                 .as_str()
                 .ok_or_else(|| anyhow!("Unable to convert {key} into string"))?;
             let bytes = BASE64_STANDARD.decode(data)?;
-            //println!("Bytes decoded: {}", str::from_utf8(&bytes)?);
-            //o.insert(serde_json::from_slice(&bytes).context("decode_entry error")?);
-            o.insert(Value::String(String::from_utf8(bytes)?));
+            if as_sse {
+                //println!("Bytes decoded: {}", str::from_utf8(&bytes)?);
+                //o.insert(serde_json::from_slice(&bytes).context("decode_entry error")?);
+                o.insert(Value::String(String::from_utf8(bytes)?));
+            } else {
+                o.insert(serde_json::from_slice(&bytes).context("decode_entry error")?);
+            }
             Ok(())
         }
     }
@@ -38,8 +42,8 @@ pub async fn write_capture(
 ) -> Result<String> {
     let mut capture: Map<String, Value> = serde_json::from_slice(data)?;
     if config.decode {
-        decode_entry(&mut capture, "req_body")?;
-        decode_entry(&mut capture, "resp_body")?;
+        decode_entry(&mut capture, "req_body", false)?;
+        decode_entry(&mut capture, "resp_body", true)?;
     }
     entry.capture = Some(capture);
 
