@@ -4,6 +4,7 @@ use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use reqwest::Client;
 use serde::de::DeserializeOwned;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 use crate::config::CaptureConfig;
@@ -34,7 +35,11 @@ pub async fn fetch_capture(
     Ok(data.to_vec())
 }
 
-pub async fn process_metrics_event(cfg: &CaptureConfig, data: &str) -> Result<()> {
+pub async fn process_metrics_event(
+    cfg: &CaptureConfig,
+    data: &str,
+    cancel: &CancellationToken,
+) -> Result<()> {
     let entries: Vec<ActivityLogEntry> = serde_json::from_str(data)?;
 
     for entry in entries.into_iter() {
@@ -42,7 +47,12 @@ pub async fn process_metrics_event(cfg: &CaptureConfig, data: &str) -> Result<()
             continue;
         }
 
-        match fetch_capture(&cfg.url, &cfg.api_key, entry.id).await {
+        let capture = tokio::select! {
+            data = fetch_capture(&cfg.url, &cfg.api_key, entry.id) => data,
+                _ = cancel.cancelled() => return Ok(()),
+        };
+
+        match capture {
             Ok(capture_data) => {
                 let id = entry.id;
                 let model = entry.model.clone();
@@ -72,12 +82,16 @@ enum SSEState {
     Skipping,
 }
 
-async fn process_sse_envelope(cfg: &CaptureConfig, envelope: SSEEnvelope) -> Result<()> {
+async fn process_sse_envelope(
+    cfg: &CaptureConfig,
+    envelope: SSEEnvelope,
+    cancel: &CancellationToken,
+) -> Result<()> {
     if envelope.type_ != "metrics" {
         return Ok(());
     }
 
-    process_metrics_event(cfg, &envelope.data)
+    process_metrics_event(cfg, &envelope.data, cancel)
         .await
         .with_context(|| "processing metrics event")
 }
@@ -180,6 +194,7 @@ impl SSEBuffer {
 pub async fn run_sse_loop<S, E>(
     cfg: &CaptureConfig,
     stream: S,
+    cancel: &CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     S: futures::Stream<Item = Result<Bytes, E>>,
@@ -189,16 +204,28 @@ where
     let mut stream = std::pin::pin!(stream);
     let mut buffer = SSEBuffer::default();
 
-    while let Some(chunk) = stream.next().await {
-        for result in buffer.process_chunk::<SSEEnvelope>(&chunk?).into_iter() {
-            match result {
-                Ok(envelope) => {
-                    if let Err(e) = process_sse_envelope(cfg, envelope).await {
-                        error!("process_sse_envelope() error: {e}");
+    loop {
+        let chunk = tokio::select! {
+            chunk = stream.next() => chunk,
+                _ = cancel.cancelled() => break,
+        };
+        match chunk {
+            Some(result) => {
+                for r in buffer.process_chunk::<SSEEnvelope>(&result?).into_iter() {
+                    match r {
+                        Ok(envelope) => {
+                            if let Err(e) = process_sse_envelope(cfg, envelope, cancel).await {
+                                error!("process_sse_envelope() error: {e}");
+                            }
+                        }
+                        Err(e) => error!("SSE loop error: {e}"),
+                    }
+                    if cancel.is_cancelled() {
+                        return Ok(());
                     }
                 }
-                Err(e) => error!("SSE loop error: {e}"),
             }
+            None => break,
         }
     }
 
@@ -208,6 +235,7 @@ where
 pub async fn connect_and_capture(
     cfg: &CaptureConfig,
     backoff_seconds: &mut i64,
+    cancel: &CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let sse_url = format!("{}/api/events", cfg.url);
 
@@ -231,7 +259,7 @@ pub async fn connect_and_capture(
     *backoff_seconds = 2;
 
     let stream = resp.bytes_stream();
-    run_sse_loop(cfg, stream).await
+    run_sse_loop(cfg, stream, cancel).await
 }
 
 pub fn backoff_delay(backoff_seconds: &mut i64) -> std::time::Duration {

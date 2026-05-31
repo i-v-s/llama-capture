@@ -1,4 +1,6 @@
 use clap::Parser;
+use tokio::signal;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 use llama_capture::config::CaptureConfig;
@@ -18,19 +20,47 @@ async fn main() {
     run(cfg).await;
 }
 
+fn setup_signal_handler(cancel: CancellationToken) {
+    tokio::spawn(async move {
+        let ctrl_c = async {
+            signal::ctrl_c()
+                .await
+                .expect("failed to install Ctrl+C handler");
+        };
+
+        #[cfg(unix)]
+        let terminate = async {
+            signal::unix::signal(signal::unix::SignalKind::terminate())
+                .expect("failed to install signal handler")
+                .recv()
+                .await;
+        };
+
+        #[cfg(not(unix))]
+        let terminate = std::future::pending::<()>();
+
+        tokio::select! {
+            _ = ctrl_c => println!("Received Ctrl+C, shutting down..."),
+            _ = terminate => println!("Received SIGTERM, shutting down..."),
+        }
+        cancel.cancel();
+    });
+}
+
 async fn run(cfg: CaptureConfig) {
-    let ctx = ShutdownCtx::new();
+    let cancel = CancellationToken::new();
+    setup_signal_handler(cancel.clone());
 
     let mut backoff_seconds = 2;
 
     info!(server = %cfg.url, output = %cfg.output, "starting llama-capture");
 
     loop {
-        if ctx.is_shutdown() {
+        if cancel.is_cancelled() {
             break;
         }
 
-        let last_ok = match sse::connect_and_capture(&cfg, &mut backoff_seconds).await {
+        let last_ok = match sse::connect_and_capture(&cfg, &mut backoff_seconds, &cancel).await {
             Ok(()) => {
                 info!("SSE connection closed, reconnecting");
                 true
@@ -41,7 +71,7 @@ async fn run(cfg: CaptureConfig) {
             }
         };
 
-        if ctx.is_shutdown() {
+        if cancel.is_cancelled() {
             break;
         }
 
@@ -52,7 +82,7 @@ async fn run(cfg: CaptureConfig) {
         };
 
         tokio::select! {
-            _ = ctx.wait() => {
+            _ = cancel.cancelled() => {
                 break;
             }
             _ = tokio::time::sleep(delay) => {}
@@ -60,42 +90,4 @@ async fn run(cfg: CaptureConfig) {
     }
 
     info!("shutting down");
-}
-
-struct ShutdownCtx {
-    #[allow(dead_code)]
-    signal: tokio::sync::watch::Sender<bool>,
-    receiver: tokio::sync::watch::Receiver<bool>,
-}
-
-impl ShutdownCtx {
-    fn new() -> Self {
-        let (signal, receiver) = tokio::sync::watch::channel(false);
-        {
-            let sig = signal.clone();
-            tokio::spawn(async move {
-                let mut sigint =
-                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-                        .unwrap();
-                let mut sigterm =
-                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                        .unwrap();
-                tokio::select! {
-                    _ = sigint.recv() => {}
-                    _ = sigterm.recv() => {}
-                }
-                let _ = sig.send(true);
-            });
-        }
-        Self { signal, receiver }
-    }
-
-    fn is_shutdown(&self) -> bool {
-        *self.receiver.borrow()
-    }
-
-    async fn wait(&self) {
-        let mut rx = self.receiver.clone();
-        let _ = rx.changed().await;
-    }
 }

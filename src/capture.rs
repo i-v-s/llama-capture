@@ -35,7 +35,7 @@ fn decode_entry(capture: &mut Map<String, Value>, key: &str, as_sse: bool) -> Re
                 let mut buffer = SSEBuffer::default();
 
                 let values: Vec<Value> = buffer
-                    .process_chunk::<Value>(&bytes)
+                    .process_chunk::<Value>(bytes)
                     .into_iter()
                     .collect::<Result<_>>()?;
                 o.insert(Value::Array(values));
