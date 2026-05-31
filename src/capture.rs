@@ -8,6 +8,7 @@ use serde_json::{Map, Value, map::Entry};
 
 use crate::config::CaptureConfig;
 use crate::models::ActivityLogEntry;
+use crate::sse::SSEBuffer;
 
 pub fn capture_file_name(ts: &DateTime<chrono::Utc>) -> String {
     let utc = *ts;
@@ -22,11 +23,22 @@ fn decode_entry(capture: &mut Map<String, Value>, key: &str, as_sse: bool) -> Re
                 .get()
                 .as_str()
                 .ok_or_else(|| anyhow!("Unable to convert {key} into string"))?;
+
             let bytes = BASE64_STANDARD.decode(data)?;
+
             if as_sse {
-                //println!("Bytes decoded: {}", str::from_utf8(&bytes)?);
-                //o.insert(serde_json::from_slice(&bytes).context("decode_entry error")?);
-                o.insert(Value::String(String::from_utf8(bytes)?));
+                let bytes = bytes
+                    .trim_ascii_end()
+                    .strip_suffix(b"[DONE]")
+                    .unwrap_or(&bytes);
+
+                let mut buffer = SSEBuffer::default();
+
+                let values: Vec<Value> = buffer
+                    .process_chunk::<Value>(&bytes)
+                    .into_iter()
+                    .collect::<Result<_>>()?;
+                o.insert(Value::Array(values));
             } else {
                 o.insert(serde_json::from_slice(&bytes).context("decode_entry error")?);
             }
@@ -54,7 +66,11 @@ pub async fn write_capture(
     let filename = dir.join(&name);
     let filename_str = filename.to_string_lossy().to_string();
 
-    let data = serde_json::to_string_pretty(&entry)?;
+    let data = if config.pretty {
+        serde_json::to_string_pretty(&entry)?
+    } else {
+        serde_json::to_string(&entry)?
+    };
     tokio::fs::write(&filename, data).await?;
     Ok(filename_str)
 }

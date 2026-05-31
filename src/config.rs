@@ -18,6 +18,10 @@ pub struct CaptureConfig {
     /// Decode conversation from base64
     #[arg(short, long)]
     pub decode: bool,
+
+    /// Pretty print output
+    #[arg(short, long)]
+    pub pretty: bool,
 }
 
 pub fn resolve_server_url(raw: &str) -> String {

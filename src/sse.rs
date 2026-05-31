@@ -3,6 +3,7 @@ use std::mem;
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use reqwest::Client;
+use serde::de::DeserializeOwned;
 use tracing::{error, info};
 
 use crate::config::CaptureConfig;
@@ -81,7 +82,7 @@ async fn process_sse_envelope(cfg: &CaptureConfig, envelope: SSEEnvelope) -> Res
         .with_context(|| "processing metrics event")
 }
 
-struct SSEBuffer {
+pub struct SSEBuffer {
     state: SSEState,
     line: Vec<u8>,
 }
@@ -96,16 +97,21 @@ impl Default for SSEBuffer {
 }
 
 impl SSEBuffer {
-    fn parse_line(state: &mut SSEState, line: Vec<u8>) -> Result<Option<SSEEnvelope>> {
+    fn parse_line<T>(state: &mut SSEState, line: Vec<u8>) -> Result<Option<T>>
+    where
+        T: DeserializeOwned,
+    {
         if line.is_empty() {
             let result = match state {
                 SSEState::Idle | SSEState::Collecting => Err(anyhow!(
                     "SSE loop: Unexpected empty line in mode {:?}",
                     state
                 )),
-                SSEState::Collected(data) => Ok(Some(
-                    serde_json::from_slice(data).with_context(|| "Error parsing SSEEnvelope")?,
-                )),
+                SSEState::Collected(data) => {
+                    Ok(Some(serde_json::from_slice(data).with_context(|| {
+                        format!("Error parsing SSE line: {:?}", &str::from_utf8(data))
+                    })?))
+                }
                 SSEState::Skipping => Ok(None),
             };
             *state = SSEState::Idle;
@@ -145,7 +151,11 @@ impl SSEBuffer {
         }
     }
 
-    pub async fn process_chunk(&mut self, chunk: &[u8], cfg: &CaptureConfig) -> () {
+    pub fn process_chunk<T>(&mut self, chunk: &[u8]) -> Vec<Result<T>>
+    where
+        T: DeserializeOwned,
+    {
+        let mut result = Vec::new();
         let mut start = 0;
         for (i, c) in chunk.iter().enumerate() {
             if *c == b'\n' {
@@ -154,12 +164,8 @@ impl SSEBuffer {
                 }
                 start = i + 1;
                 match Self::parse_line(&mut self.state, mem::take(&mut self.line)) {
-                    Err(e) => error!("SSE loop error: {e}"),
-                    Ok(Some(envelope)) => {
-                        if let Err(e) = process_sse_envelope(cfg, envelope).await {
-                            error!("process_sse_envelope() error: {e}");
-                        }
-                    }
+                    Err(e) => result.push(Err(e)), // error!("SSE loop error: {e}"),
+                    Ok(Some(value)) => result.push(Ok(value)),
                     Ok(None) => {}
                 }
             }
@@ -167,6 +173,7 @@ impl SSEBuffer {
         if start < chunk.len() {
             self.line.extend_from_slice(&chunk[start..]);
         }
+        result
     }
 }
 
@@ -183,7 +190,16 @@ where
     let mut buffer = SSEBuffer::default();
 
     while let Some(chunk) = stream.next().await {
-        buffer.process_chunk(&chunk?, cfg).await;
+        for result in buffer.process_chunk::<SSEEnvelope>(&chunk?).into_iter() {
+            match result {
+                Ok(envelope) => {
+                    if let Err(e) = process_sse_envelope(cfg, envelope).await {
+                        error!("process_sse_envelope() error: {e}");
+                    }
+                }
+                Err(e) => error!("SSE loop error: {e}"),
+            }
+        }
     }
 
     Ok(())
