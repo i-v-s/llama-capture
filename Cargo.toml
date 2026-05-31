@@ -1,0 +1,24 @@
+[package]
+name = "llama-capture"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.13", default-features = false, features = ["stream"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
+futures = "0.3"
+bytes = "1"
+anyhow = "1.0.102"
+base64 = "0.22.1"
+
+[dev-dependencies]
+tempfile = "3"
+tokio-util = { version = "0.7", features = ["io"] }
+futures = "0.3"
