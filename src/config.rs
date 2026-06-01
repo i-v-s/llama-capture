@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use clap::Parser;
 
 #[derive(Debug, Parser)]
@@ -7,8 +9,8 @@ pub struct CaptureConfig {
     #[arg(short, long)]
     pub url: String,
 
-    /// Output folder for capture log files
-    #[arg(short, long)]
+    /// Output folder to write capture files (use '-' for stdout)
+    #[arg(short, long, default_value = "-")]
     pub output: String,
 
     /// API key for authentication (optional)
@@ -22,6 +24,20 @@ pub struct CaptureConfig {
     /// Pretty print output
     #[arg(short, long)]
     pub pretty: bool,
+}
+
+impl CaptureConfig {
+    pub fn is_stdout(&self) -> bool {
+        self.output == "-"
+    }
+
+    pub fn output_folder(&self) -> Option<&Path> {
+        if self.is_stdout() {
+            None
+        } else {
+            Some(Path::new(&self.output))
+        }
+    }
 }
 
 pub fn resolve_server_url(raw: &str) -> String {

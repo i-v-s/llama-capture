@@ -4,9 +4,11 @@ use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use reqwest::Client;
 use serde::de::DeserializeOwned;
+use tokio::fs::try_exists;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
+use crate::capture::{capture_file_name, write_capture};
 use crate::config::CaptureConfig;
 use crate::models::{ActivityLogEntry, SSEEnvelope};
 
@@ -47,27 +49,36 @@ pub async fn process_metrics_event(
             continue;
         }
 
+        let filename = cfg
+            .output_folder()
+            .map(|o| o.join(capture_file_name(&entry.timestamp, entry.id)));
+        let id = entry.id;
+        let model = entry.model.clone();
+        let file_str = filename
+            .as_ref()
+            .map_or("stdout", |f| f.to_str().unwrap_or_default());
+
+        if let Some(path) = &filename
+            && try_exists(path).await.unwrap_or(false)
+        {
+            info!(id, model, file = %file_str, "File exists");
+            continue;
+        }
+
         let capture = tokio::select! {
-            data = fetch_capture(&cfg.url, &cfg.api_key, entry.id) => data,
-                _ = cancel.cancelled() => return Ok(()),
+            data = fetch_capture(&cfg.url, &cfg.api_key, id) => match data {
+                Ok(data) => data,
+                Err(e) => {
+                    error!(id, error = %e, "Fetch capture");
+                    continue;
+                }
+            },
+            _ = cancel.cancelled() => break,
         };
 
-        match capture {
-            Ok(capture_data) => {
-                let id = entry.id;
-                let model = entry.model.clone();
-                match crate::capture::write_capture(entry, &capture_data, cfg).await {
-                    Ok(filename) => {
-                        info!(id, model, file = %filename, "captured");
-                    }
-                    Err(e) => {
-                        error!(id, error = %e, "write capture");
-                    }
-                }
-            }
-            Err(e) => {
-                error!(id = entry.id, error = %e, "fetch capture");
-            }
+        match write_capture(entry, &capture, cfg, &filename).await {
+            Ok(()) => info!(id, model, file = %file_str, "Captured"),
+            Err(e) => error!(id, file = %file_str, error = %e, "Write capture"),
         }
     }
 
@@ -221,7 +232,7 @@ where
                         Err(e) => error!("SSE loop error: {e}"),
                     }
                     if cancel.is_cancelled() {
-                        return Ok(());
+                        break;
                     }
                 }
             }

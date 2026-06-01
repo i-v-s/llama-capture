@@ -1,18 +1,21 @@
-use std::path::Path;
+use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow};
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
 use chrono::DateTime;
 use serde_json::{Map, Value, map::Entry};
+use tokio::{
+    fs,
+    io::{AsyncWriteExt, stdout},
+};
 
 use crate::config::CaptureConfig;
 use crate::models::ActivityLogEntry;
 use crate::sse::SSEBuffer;
 
-pub fn capture_file_name(ts: &DateTime<chrono::Utc>) -> String {
-    let utc = *ts;
-    utc.format("%Y-%m-%dT%H-%M-%S").to_string()
+pub fn capture_file_name(ts: &DateTime<chrono::Utc>, id: i64) -> String {
+    format!("{}_{:04}.json", ts.format("%Y-%m-%dT%H-%M"), id)
 }
 
 fn decode_entry(capture: &mut Map<String, Value>, key: &str, as_sse: bool) -> Result<()> {
@@ -22,7 +25,7 @@ fn decode_entry(capture: &mut Map<String, Value>, key: &str, as_sse: bool) -> Re
             let data = o
                 .get()
                 .as_str()
-                .ok_or_else(|| anyhow!("Unable to convert {key} into string"))?;
+                .ok_or_else(|| anyhow!("Unable to convert {key} into string."))?;
 
             let bytes = BASE64_STANDARD.decode(data)?;
 
@@ -51,7 +54,8 @@ pub async fn write_capture(
     mut entry: ActivityLogEntry,
     data: &[u8],
     config: &CaptureConfig,
-) -> Result<String> {
+    filename: &Option<PathBuf>,
+) -> Result<()> {
     let mut capture: Map<String, Value> = serde_json::from_slice(data)?;
     if config.decode {
         decode_entry(&mut capture, "req_body", false)?;
@@ -59,18 +63,21 @@ pub async fn write_capture(
     }
     entry.capture = Some(capture);
 
-    let dir = Path::new(&config.output);
-    tokio::fs::create_dir_all(dir).await?;
-
-    let name = capture_file_name(&entry.timestamp) + ".json";
-    let filename = dir.join(&name);
-    let filename_str = filename.to_string_lossy().to_string();
-
-    let data = if config.pretty {
+    let json = if config.pretty {
         serde_json::to_string_pretty(&entry)?
     } else {
         serde_json::to_string(&entry)?
     };
-    tokio::fs::write(&filename, data).await?;
-    Ok(filename_str)
+
+    match filename {
+        Some(path) => fs::write(&path, json).await?,
+        None => {
+            let mut stdout = stdout();
+            stdout.write_all(json.as_bytes()).await?;
+            stdout.write_all(b"\n").await?;
+            stdout.flush().await?;
+        }
+    }
+
+    Ok(())
 }

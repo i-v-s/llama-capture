@@ -13,9 +13,14 @@ async fn main() {
             tracing_subscriber::EnvFilter::from_default_env()
                 .add_directive("llama_capture=info".parse().unwrap()),
         )
+        .with_writer(std::io::stderr)
         .init();
 
     let cfg = CaptureConfig::parse();
+    if !cfg.is_stdout() && !std::fs::metadata(&cfg.output).is_ok_and(|m| m.is_dir()) {
+        error!("Error: output path '{}' is not a directory", cfg.output);
+        std::process::exit(1);
+    }
 
     run(cfg).await;
 }
@@ -40,8 +45,8 @@ fn setup_signal_handler(cancel: CancellationToken) {
         let terminate = std::future::pending::<()>();
 
         tokio::select! {
-            _ = ctrl_c => println!("Received Ctrl+C, shutting down..."),
-            _ = terminate => println!("Received SIGTERM, shutting down..."),
+            _ = ctrl_c => info!("Received Ctrl+C, shutting down..."),
+            _ = terminate => info!("Received SIGTERM, shutting down..."),
         }
         cancel.cancel();
     });
