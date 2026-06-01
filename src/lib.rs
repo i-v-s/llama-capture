@@ -7,48 +7,14 @@ pub mod sse;
 mod tests {
     use crate::capture::{capture_file_name, write_capture};
     use crate::config::{CaptureConfig, resolve_server_url};
-    use crate::models::ActivityLogEntry;
+    use crate::models::{ActivityLogEntry, SSEEnvelope};
     use crate::sse::{
-        backoff_delay, fetch_capture, parse_metrics_event, parse_sse_envelope,
-        process_metrics_event, run_sse_loop,
+        SSEBuffer, backoff_delay, fetch_capture, process_metrics_event, run_sse_loop,
     };
     use chrono::TimeZone;
-    use std::path::Path;
-    use tokio::io::AsyncWriteExt;
-
-    // --- parse_metrics_event tests ---
-
-    #[test]
-    fn test_parse_metrics_event_single_entry_with_capture() {
-        let payload = r#"[{"id":42,"timestamp":"2025-01-15T10:30:00Z","model":"llama3","req_path":"/v1/chat/completions","resp_content_type":"application/json","resp_status_code":200,"tokens":{"cache_tokens":0,"input_tokens":10,"output_tokens":20,"prompt_per_second":100,"tokens_per_second":50},"duration_ms":500,"has_capture":true}]"#;
-        let entries = parse_metrics_event(payload).expect("unexpected error");
-        assert_eq!(entries.len(), 1);
-        let e = &entries[0];
-        assert_eq!(e.id, 42);
-        assert!(e.has_capture);
-        assert_eq!(e.model, "llama3");
-    }
-
-    #[test]
-    fn test_parse_metrics_event_multiple_entries() {
-        let payload = r#"[{"id":1,"has_capture":true,"timestamp":"2025-01-15T10:30:00Z","model":"m1","req_path":"/v1/chat/completions","resp_content_type":"application/json","resp_status_code":200,"tokens":{},"duration_ms":100},{"id":2,"has_capture":false,"timestamp":"2025-01-15T10:31:00Z","model":"m2","req_path":"/v1/chat/completions","resp_content_type":"application/json","resp_status_code":200,"tokens":{},"duration_ms":200}]"#;
-        let entries = parse_metrics_event(payload).expect("unexpected error");
-        assert_eq!(entries.len(), 2);
-        assert!(entries[0].has_capture);
-        assert!(!entries[1].has_capture);
-    }
-
-    #[test]
-    fn test_parse_metrics_event_empty_array() {
-        let entries = parse_metrics_event("[]").expect("unexpected error");
-        assert_eq!(entries.len(), 0);
-    }
-
-    #[test]
-    fn test_parse_metrics_event_invalid_json() {
-        let result = parse_metrics_event("not json");
-        assert!(result.is_err());
-    }
+    use std::path::PathBuf;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_util::sync::CancellationToken;
 
     // --- capture_file_name tests ---
 
@@ -57,83 +23,101 @@ mod tests {
         let ts = chrono::Utc
             .with_ymd_and_hms(2025, 1, 15, 10, 30, 0)
             .unwrap();
-        let name = capture_file_name(&ts);
-        assert_eq!(name, "2025-01-15T10-30-00");
+        let name = capture_file_name(&ts, 42);
+        assert_eq!(name, "2025-01-15T10-30_0042.json");
     }
 
     #[test]
-    fn test_capture_file_name_zero_time() {
-        let ts = chrono::Utc.with_ymd_and_hms(1, 1, 1, 0, 0, 0).unwrap();
-        let name = capture_file_name(&ts);
-        assert_eq!(name, "0001-01-01T00-00-00");
-    }
-
-    #[test]
-    fn test_capture_file_name_no_timezone_suffix() {
+    fn test_capture_file_name_zero_id() {
         let ts = chrono::Utc
             .with_ymd_and_hms(2025, 6, 1, 23, 59, 59)
             .unwrap();
-        let name = capture_file_name(&ts);
-        assert!(!name.ends_with('Z'));
-        assert!(!name.contains("+"));
+        let name = capture_file_name(&ts, 0);
+        assert_eq!(name, "2025-06-01T23-59_0000.json");
+    }
+
+    #[test]
+    fn test_capture_file_name_large_id() {
+        let ts = chrono::Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let name = capture_file_name(&ts, 99999);
+        assert_eq!(name, "2025-01-01T00-00_99999.json");
     }
 
     // --- write_capture tests ---
 
-    #[tokio::test]
-    async fn test_write_capture_writes_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path();
-        let ts = chrono::Utc
-            .with_ymd_and_hms(2025, 3, 10, 14, 20, 30)
-            .unwrap();
-        let entry = ActivityLogEntry {
-            id: 7,
+    fn make_entry(ts: chrono::DateTime<chrono::Utc>, id: i64) -> ActivityLogEntry {
+        ActivityLogEntry {
+            id,
             timestamp: ts,
-            model: "test-model".to_string(),
-            req_path: "/v1/chat/completions".to_string(),
+            model: "test".to_string(),
+            req_path: "/v1/chat".to_string(),
             resp_content_type: "application/json".to_string(),
             resp_status_code: 200,
             tokens: Default::default(),
             duration_ms: 0,
             has_capture: true,
             capture: None,
-        };
-        let data = br#"{"id":7}"#;
+        }
+    }
 
-        let filename = write_capture(path.to_str().unwrap(), &entry, data)
-            .await
-            .unwrap();
-        let expected = path.join("2025-03-10T14-20-30.log");
-        assert_eq!(Path::new(&filename), expected);
-
-        let got = tokio::fs::read(&filename).await.unwrap();
-        assert_eq!(got, data);
+    fn make_config(output: &str, decode: bool, pretty: bool) -> CaptureConfig {
+        CaptureConfig {
+            url: "http://localhost:8080".to_string(),
+            output: output.to_string(),
+            api_key: "".to_string(),
+            decode,
+            pretty,
+        }
     }
 
     #[tokio::test]
-    async fn test_write_capture_creates_output_dir() {
-        let base = tempfile::tempdir().unwrap();
-        let dir = base.path().join("sub").join("dir");
+    async fn test_write_capture_writes_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let ts = chrono::Utc
+            .with_ymd_and_hms(2025, 3, 10, 14, 20, 30)
+            .unwrap();
+        let entry = make_entry(ts, 7);
+        let data = br#"{"key":"val"}"#;
+
+        let cfg = make_config(dir.path().to_str().unwrap(), false, false);
+        let filename: Option<PathBuf> = Some(dir.path().join("2025-03-10T14-20_0007.json"));
+
+        write_capture(entry, data, &cfg, &filename).await.unwrap();
+
+        let got = tokio::fs::read(filename.as_ref().unwrap()).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&got).unwrap();
+        assert_eq!(json["capture"]["key"], "val");
+        assert_eq!(json["id"], 7);
+    }
+
+    #[tokio::test]
+    async fn test_write_capture_pretty() {
+        let dir = tempfile::tempdir().unwrap();
         let ts = chrono::Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
-        let entry = ActivityLogEntry {
-            id: 0,
-            timestamp: ts,
-            model: "".to_string(),
-            req_path: "".to_string(),
-            resp_content_type: "".to_string(),
-            resp_status_code: 0,
-            tokens: Default::default(),
-            duration_ms: 0,
-            has_capture: false,
-            capture: None,
-        };
+        let entry = make_entry(ts, 1);
         let data = br#"{}"#;
 
-        let _ = write_capture(dir.to_str().unwrap(), &entry, data)
+        let cfg = make_config(dir.path().to_str().unwrap(), false, true);
+        let filename: Option<PathBuf> = Some(dir.path().join("2025-01-01T00-00_0001.json"));
+
+        write_capture(entry, data, &cfg, &filename).await.unwrap();
+
+        let content = tokio::fs::read_to_string(filename.as_ref().unwrap())
             .await
             .unwrap();
-        assert!(dir.exists());
+        assert!(content.contains('\n'));
+    }
+
+    #[tokio::test]
+    async fn test_write_capture_stdout() {
+        let ts = chrono::Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let entry = make_entry(ts, 1);
+        let data = br#"{}"#;
+
+        let cfg = make_config("-", false, false);
+        let filename: Option<PathBuf> = None;
+
+        write_capture(entry, data, &cfg, &filename).await.unwrap();
     }
 
     // --- fetch_capture tests ---
@@ -143,9 +127,9 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
-                let handler = handler;
+                let h = handler;
                 tokio::spawn(async move {
-                    handler(stream);
+                    h(stream);
                 });
             }
         });
@@ -157,7 +141,6 @@ mod tests {
         let url = start_mock_server(|mut stream| {
             let resp = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 20\r\n\r\n{\"id\":99,\"path\":\"/\"}";
             tokio::spawn(async move {
-                // write directly
                 let _ = stream.write_all(resp).await;
             });
         })
@@ -168,39 +151,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_fetch_capture_sends_api_key() {
-        let url = start_mock_server(|mut stream| {
-            let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}";
-            tokio::spawn(async move {
-                // write directly
-                let _ = stream.write_all(resp).await;
-            });
-        })
-        .await;
-
-        let _ = fetch_capture(&url, "test-key-123", 1).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_fetch_capture_skips_empty_api_key() {
-        let url = start_mock_server(|mut stream| {
-            let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}";
-            tokio::spawn(async move {
-                // write directly
-                let _ = stream.write_all(resp).await;
-            });
-        })
-        .await;
-
-        let _ = fetch_capture(&url, "", 1).await.unwrap();
-    }
-
-    #[tokio::test]
     async fn test_fetch_capture_error_on_non_200() {
         let url = start_mock_server(|mut stream| {
             let resp = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
             tokio::spawn(async move {
-                // write directly
                 let _ = stream.write_all(resp).await;
             });
         })
@@ -210,27 +164,62 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // --- parse_sse_envelope tests ---
+    // --- SSEBuffer tests ---
+
+    fn sse_data_line(payload: &str) -> String {
+        format!("event: message\ndata: {}\n\n", payload)
+    }
 
     #[test]
-    fn test_parse_sse_envelope_metrics() {
-        let envelope = r#"{"type":"metrics","data":"[{\"id\":1}]"}"#;
-        let env = parse_sse_envelope(envelope).expect("should parse");
+    fn test_sse_buffer_parses_envelope() {
+        let mut buf = SSEBuffer::default();
+        let payload = r#"{"type":"metrics","data":"[{\"id\":1}]"}"#;
+        let lines = sse_data_line(payload);
+        let results: Vec<Result<SSEEnvelope, anyhow::Error>> =
+            buf.process_chunk::<SSEEnvelope>(lines.as_bytes());
+        assert_eq!(results.len(), 1);
+        let env = results[0].as_ref().unwrap();
         assert_eq!(env.type_, "metrics");
         assert_eq!(env.data, r#"[{"id":1}]"#);
     }
 
     #[test]
-    fn test_parse_sse_envelope_non_metrics() {
-        let envelope = r#"{"type":"modelStatus","data":"[]"}"#;
-        let env = parse_sse_envelope(envelope).expect("should parse");
-        assert_eq!(env.type_, "modelStatus");
+    fn test_sse_buffer_splits_across_chunks() {
+        let mut buf = SSEBuffer::default();
+        let payload = r#"{"type":"metrics","data":"[]"}"#;
+        let lines = sse_data_line(payload);
+        let mid = lines.len() / 2;
+        let chunk1 = &lines[..mid];
+        let chunk2 = &lines[mid..];
+
+        let r1: Vec<Result<SSEEnvelope, anyhow::Error>> =
+            buf.process_chunk::<SSEEnvelope>(chunk1.as_bytes());
+        assert_eq!(r1.len(), 0);
+        let r2: Vec<Result<SSEEnvelope, anyhow::Error>> =
+            buf.process_chunk::<SSEEnvelope>(chunk2.as_bytes());
+        assert_eq!(r2.len(), 1);
+        let env = r2[0].as_ref().unwrap();
+        assert_eq!(env.type_, "metrics");
     }
 
     #[test]
-    fn test_parse_sse_envelope_invalid_json() {
-        let result = parse_sse_envelope("not json");
-        assert!(result.is_none());
+    fn test_sse_buffer_skips_non_message_event() {
+        let mut buf = SSEBuffer::default();
+        let lines = "event: other\ndata: ignored\n\n";
+        let results: Vec<Result<SSEEnvelope, anyhow::Error>> =
+            buf.process_chunk::<SSEEnvelope>(lines.as_bytes());
+        assert_eq!(results.len(), 0);
+    }
+
+    #[test]
+    fn test_sse_buffer_multiple_events() {
+        let mut buf = SSEBuffer::default();
+        let lines = "event: message\ndata: {\"type\":\"a\",\"data\":\"1\"}\n\nevent: message\ndata: {\"type\":\"b\",\"data\":\"2\"}\n\n";
+        let results: Vec<Result<SSEEnvelope, anyhow::Error>> =
+            buf.process_chunk::<SSEEnvelope>(lines.as_bytes());
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].as_ref().unwrap().type_, "a");
+        assert_eq!(results[1].as_ref().unwrap().type_, "b");
     }
 
     // --- process_metrics_event tests ---
@@ -241,7 +230,6 @@ mod tests {
         let url = start_mock_server(|mut stream| {
             let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}";
             tokio::spawn(async move {
-                // write directly
                 let _ = stream.write_all(resp).await;
             });
         })
@@ -252,10 +240,12 @@ mod tests {
             api_key: "".to_string(),
             output: dir.path().to_str().unwrap().to_string(),
             decode: false,
+            pretty: false,
         };
         let payload = r#"[{"id":1,"timestamp":"2025-01-01T00:00:00Z","model":"m","req_path":"/v1/chat/completions","resp_content_type":"application/json","resp_status_code":200,"tokens":{},"duration_ms":0,"has_capture":true}]"#;
-        process_metrics_event(&cfg, payload).await.unwrap();
-        assert!(dir.path().join("2025-01-01T00-00-00.log").exists());
+        let cancel = CancellationToken::new();
+        process_metrics_event(&cfg, payload, &cancel).await.unwrap();
+        assert!(dir.path().join("2025-01-01T00-00_0001.json").exists());
     }
 
     #[tokio::test]
@@ -266,9 +256,11 @@ mod tests {
             api_key: "".to_string(),
             output: dir.path().to_str().unwrap().to_string(),
             decode: false,
+            pretty: false,
         };
         let payload = r#"[{"id":1,"timestamp":"2025-01-01T00:00:00Z","model":"m","req_path":"/v1/chat/completions","resp_content_type":"application/json","resp_status_code":200,"tokens":{},"duration_ms":0,"has_capture":false}]"#;
-        process_metrics_event(&cfg, payload).await.unwrap();
+        let cancel = CancellationToken::new();
+        process_metrics_event(&cfg, payload, &cancel).await.unwrap();
         assert_eq!(dir.path().read_dir().unwrap().count(), 0);
     }
 
@@ -279,46 +271,93 @@ mod tests {
             url: "http://localhost:8080".to_string(),
             api_key: "".to_string(),
             output: dir.path().to_str().unwrap().to_string(),
+            decode: false,
+            pretty: false,
         };
-        process_metrics_event(&cfg, "[]").await.unwrap();
+        let cancel = CancellationToken::new();
+        process_metrics_event(&cfg, "[]", &cancel).await.unwrap();
         assert_eq!(dir.path().read_dir().unwrap().count(), 0);
     }
 
-    // --- run_sse_loop tests ---
-
     #[tokio::test]
-    async fn test_run_sse_loop_skips_initial_metrics() {
+    async fn test_process_metrics_event_skips_existing_file() {
         let dir = tempfile::tempdir().unwrap();
         let url = start_mock_server(|mut stream| {
             let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}";
             tokio::spawn(async move {
-                // write directly
                 let _ = stream.write_all(resp).await;
             });
         })
         .await;
 
         let cfg = CaptureConfig {
-            server_url: url,
+            url,
             api_key: "".to_string(),
-            output_dir: dir.path().to_str().unwrap().to_string(),
+            output: dir.path().to_str().unwrap().to_string(),
+            decode: false,
+            pretty: false,
+        };
+        let payload = r#"[{"id":1,"timestamp":"2025-01-01T00:00:00Z","model":"m","req_path":"/v1/chat/completions","resp_content_type":"application/json","resp_status_code":200,"tokens":{},"duration_ms":0,"has_capture":true}]"#;
+        let cancel = CancellationToken::new();
+
+        process_metrics_event(&cfg, payload, &cancel).await.unwrap();
+        let file = dir.path().join("2025-01-01T00-00_0001.json");
+        assert!(file.exists());
+        let content1 = tokio::fs::read_to_string(&file).await.unwrap();
+
+        process_metrics_event(&cfg, payload, &cancel).await.unwrap();
+        let content2 = tokio::fs::read_to_string(&file).await.unwrap();
+        assert_eq!(content1, content2);
+    }
+
+    #[tokio::test]
+    async fn test_process_metrics_event_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let cfg = CaptureConfig {
+            url: "http://localhost:8080".to_string(),
+            api_key: "".to_string(),
+            output: dir.path().to_str().unwrap().to_string(),
+            decode: false,
+            pretty: false,
+        };
+        let payload = r#"[{"id":1,"timestamp":"2025-01-01T00:00:00Z","model":"m","req_path":"/v1/chat/completions","resp_content_type":"application/json","resp_status_code":200,"tokens":{},"duration_ms":0,"has_capture":true}]"#;
+        process_metrics_event(&cfg, payload, &cancel).await.unwrap();
+        assert_eq!(dir.path().read_dir().unwrap().count(), 0);
+    }
+
+    // --- run_sse_loop tests ---
+
+    #[tokio::test]
+    async fn test_run_sse_loop_processes_metrics() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = start_mock_server(|mut stream| {
+            let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}";
+            tokio::spawn(async move {
+                let _ = stream.write_all(resp).await;
+            });
+        })
+        .await;
+
+        let cfg = CaptureConfig {
+            url,
+            api_key: "".to_string(),
+            output: dir.path().to_str().unwrap().to_string(),
+            decode: false,
+            pretty: false,
         };
 
-        let initial_metrics = r#"[{"id":0,"timestamp":"2025-01-01T00:00:00Z","model":"m","req_path":"/v1/chat/completions","resp_content_type":"application/json","resp_status_code":200,"tokens":{},"duration_ms":0,"has_capture":true}]"#;
-        let initial_env = serde_json::json!({"type": "metrics", "data": initial_metrics});
-        let new_metrics = r#"[{"id":1,"timestamp":"2025-01-01T00:01:00Z","model":"m","req_path":"/v1/chat/completions","resp_content_type":"application/json","resp_status_code":200,"tokens":{},"duration_ms":0,"has_capture":true}]"#;
-        let new_env = serde_json::json!({"type": "metrics", "data": new_metrics});
-
-        let sse_lines = format!("data: {}\n\ndata: {}\n\n", initial_env, new_env);
-        let reader = std::io::Cursor::new(sse_lines.into_bytes());
+        let metrics = r#"[{"id":1,"timestamp":"2025-01-01T00:00:00Z","model":"m","req_path":"/v1/chat/completions","resp_content_type":"application/json","resp_status_code":200,"tokens":{},"duration_ms":0,"has_capture":true}]"#;
+        let env = serde_json::json!({"type": "metrics", "data": metrics});
+        let sse_lines = format!("event: message\ndata: {}\n\n", env);
+        let reader = std::io::Cursor::new(sse_lines.as_bytes());
         let stream = tokio_util::io::ReaderStream::new(reader);
 
-        let mut skipped_initial = false;
-        run_sse_loop(&cfg, stream, &mut skipped_initial)
-            .await
-            .unwrap();
-        assert!(!dir.path().join("2025-01-01T00-00-00.log").exists());
-        assert!(dir.path().join("2025-01-01T00-01-00.log").exists());
+        let cancel = CancellationToken::new();
+        run_sse_loop(&cfg, stream, &cancel).await.unwrap();
+        assert!(dir.path().join("2025-01-01T00-00_0001.json").exists());
     }
 
     #[tokio::test]
@@ -327,32 +366,29 @@ mod tests {
         let url = start_mock_server(|mut stream| {
             let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}";
             tokio::spawn(async move {
-                // write directly
                 let _ = stream.write_all(resp).await;
             });
         })
         .await;
 
         let cfg = CaptureConfig {
-            server_url: url,
+            url,
             api_key: "".to_string(),
-            output_dir: dir.path().to_str().unwrap().to_string(),
+            output: dir.path().to_str().unwrap().to_string(),
             decode: false,
+            pretty: false,
         };
 
         let multi_metrics = r#"[{"id":1,"timestamp":"2025-01-01T00:00:00Z","model":"m","req_path":"/v1/chat/completions","resp_content_type":"application/json","resp_status_code":200,"tokens":{},"duration_ms":0,"has_capture":true},{"id":2,"timestamp":"2025-01-01T00:01:00Z","model":"m","req_path":"/v1/chat/completions","resp_content_type":"application/json","resp_status_code":200,"tokens":{},"duration_ms":0,"has_capture":true}]"#;
         let env = serde_json::json!({"type": "metrics", "data": multi_metrics});
-
-        let sse_lines = format!("data: {}\n\n", env);
-        let reader = std::io::Cursor::new(sse_lines.into_bytes());
+        let sse_lines = format!("event: message\ndata: {}\n\n", env);
+        let reader = std::io::Cursor::new(sse_lines.as_bytes());
         let stream = tokio_util::io::ReaderStream::new(reader);
 
-        let mut skipped_initial = true;
-        run_sse_loop(&cfg, stream, &mut skipped_initial)
-            .await
-            .unwrap();
-        assert!(dir.path().join("2025-01-01T00-00-00.log").exists());
-        assert!(dir.path().join("2025-01-01T00-01-00.log").exists());
+        let cancel = CancellationToken::new();
+        run_sse_loop(&cfg, stream, &cancel).await.unwrap();
+        assert!(dir.path().join("2025-01-01T00-00_0001.json").exists());
+        assert!(dir.path().join("2025-01-01T00-01_0002.json").exists());
     }
 
     #[tokio::test]
@@ -361,22 +397,22 @@ mod tests {
         let url = start_mock_server(|mut stream| {
             let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}";
             tokio::spawn(async move {
-                // write directly
                 let _ = stream.write_all(resp).await;
             });
         })
         .await;
 
         let cfg = CaptureConfig {
-            server_url: url,
+            url,
             api_key: "".to_string(),
-            output_dir: dir.path().to_str().unwrap().to_string(),
+            output: dir.path().to_str().unwrap().to_string(),
             decode: false,
+            pretty: false,
         };
 
         let metrics = r#"[{"id":1,"timestamp":"2025-01-01T00:00:00Z","model":"m","req_path":"/v1/chat/completions","resp_content_type":"application/json","resp_status_code":200,"tokens":{},"duration_ms":0,"has_capture":true}]"#;
         let env = serde_json::json!({"type": "metrics", "data": metrics});
-        let sse_lines = format!("data: {}\n\n", env);
+        let sse_lines = format!("event: message\ndata: {}\n\n", env);
         let split = sse_lines.find(r#""data""#).unwrap();
         let bytes = sse_lines.as_bytes();
         let chunks: Vec<Result<bytes::Bytes, std::io::Error>> = vec![
@@ -385,68 +421,97 @@ mod tests {
         ];
         let stream = futures::stream::iter(chunks);
 
-        let mut skipped_initial = true;
-        run_sse_loop(&cfg, stream, &mut skipped_initial)
-            .await
-            .unwrap();
-        assert!(dir.path().join("2025-01-01T00-00-00.log").exists());
+        let cancel = CancellationToken::new();
+        run_sse_loop(&cfg, stream, &cancel).await.unwrap();
+        assert!(dir.path().join("2025-01-01T00-00_0001.json").exists());
     }
 
-    // --- validate_flags tests ---
+    #[tokio::test]
+    async fn test_run_sse_loop_cancelled() {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let cfg = CaptureConfig {
+            url: "http://localhost:8080".to_string(),
+            api_key: "".to_string(),
+            output: "-".to_string(),
+            decode: false,
+            pretty: false,
+        };
+
+        let chunks: Vec<Result<bytes::Bytes, std::io::Error>> = vec![];
+        let stream = futures::stream::iter(chunks);
+        run_sse_loop(&cfg, stream, &cancel).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_run_sse_loop_skips_non_metrics() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = CaptureConfig {
+            url: "http://localhost:8080".to_string(),
+            api_key: "".to_string(),
+            output: dir.path().to_str().unwrap().to_string(),
+            decode: false,
+            pretty: false,
+        };
+
+        let sse_lines = "event: message\ndata: {\"type\":\"modelStatus\",\"data\":\"[]\"}\n\n";
+        let reader = std::io::Cursor::new(sse_lines.as_bytes());
+        let stream = tokio_util::io::ReaderStream::new(reader);
+
+        let cancel = CancellationToken::new();
+        run_sse_loop(&cfg, stream, &cancel).await.unwrap();
+        assert_eq!(dir.path().read_dir().unwrap().count(), 0);
+    }
+
+    // --- CaptureConfig helper tests ---
 
     #[test]
-    fn test_validate_flags_missing_server() {
-        let cli = CliArgs {
-            server: "".to_string(),
+    fn test_config_is_stdout() {
+        let cfg = CaptureConfig {
+            url: "http://localhost:8080".to_string(),
+            output: "-".to_string(),
+            api_key: "".to_string(),
+            decode: false,
+            pretty: false,
+        };
+        assert!(cfg.is_stdout());
+    }
+
+    #[test]
+    fn test_config_is_not_stdout() {
+        let cfg = CaptureConfig {
+            url: "http://localhost:8080".to_string(),
             output: "/tmp/out".to_string(),
             api_key: "".to_string(),
+            decode: false,
+            pretty: false,
         };
-        let result = CaptureConfig::new(cli);
-        assert!(result.is_err());
+        assert!(!cfg.is_stdout());
     }
 
     #[test]
-    fn test_validate_flags_missing_output() {
-        let cli = CliArgs {
-            server: "http://localhost:8080".to_string(),
-            output: "".to_string(),
+    fn test_config_output_folder_stdout() {
+        let cfg = CaptureConfig {
+            url: "http://localhost:8080".to_string(),
+            output: "-".to_string(),
             api_key: "".to_string(),
+            decode: false,
+            pretty: false,
         };
-        let result = CaptureConfig::new(cli);
-        assert!(result.is_err());
+        assert!(cfg.output_folder().is_none());
     }
 
     #[test]
-    fn test_validate_flags_valid_with_api_key() {
-        let cli = CliArgs {
-            server: "http://localhost:8080".to_string(),
-            output: "/tmp/out".to_string(),
-            api_key: "secret".to_string(),
-        };
-        let result = CaptureConfig::new(cli);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_validate_flags_valid_without_api_key() {
-        let cli = CliArgs {
-            server: "http://localhost:8080".to_string(),
+    fn test_config_output_folder_path() {
+        let cfg = CaptureConfig {
+            url: "http://localhost:8080".to_string(),
             output: "/tmp/out".to_string(),
             api_key: "".to_string(),
+            decode: false,
+            pretty: false,
         };
-        let result = CaptureConfig::new(cli);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_validate_flags_invalid_server_url() {
-        let cli = CliArgs {
-            server: "/".to_string(),
-            output: "/tmp/out".to_string(),
-            api_key: "".to_string(),
-        };
-        let result = CaptureConfig::new(cli);
-        assert!(result.is_err());
+        assert_eq!(cfg.output_folder(), Some(std::path::Path::new("/tmp/out")));
     }
 
     // --- resolve_server_url tests ---
@@ -499,5 +564,237 @@ mod tests {
         let d = backoff_delay(&mut bs);
         assert_eq!(d, std::time::Duration::from_secs(60));
         assert_eq!(bs, 60);
+    }
+
+    #[test]
+    fn test_backoff_delay_from_1() {
+        let mut bs = 1;
+        let d = backoff_delay(&mut bs);
+        assert_eq!(d, std::time::Duration::from_secs(2));
+        assert_eq!(bs, 2);
+    }
+
+    // --- write_capture decode tests ---
+
+    #[tokio::test]
+    async fn test_write_capture_decode_base64() {
+        let dir = tempfile::tempdir().unwrap();
+        let ts = chrono::Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let entry = make_entry(ts, 1);
+
+        let req_body =
+            base64::Engine::encode(&base64::prelude::BASE64_STANDARD, r#"{"prompt":"hello"}"#);
+        let resp_body = base64::Engine::encode(
+            &base64::prelude::BASE64_STANDARD,
+            "event: message\ndata: {\"content\":\"hi\"}\n\n",
+        );
+        let data = format!(
+            r#"{{"req_body":"{}","resp_body":"{}"}}"#,
+            req_body, resp_body
+        );
+
+        let cfg = make_config(dir.path().to_str().unwrap(), true, false);
+        let filename: Option<PathBuf> = Some(dir.path().join("2025-01-01T00-00_0001.json"));
+        write_capture(entry, data.as_bytes(), &cfg, &filename)
+            .await
+            .unwrap();
+
+        let content = tokio::fs::read_to_string(filename.as_ref().unwrap())
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(json["capture"]["req_body"]["prompt"], "hello");
+        assert_eq!(json["capture"]["resp_body"][0]["content"], "hi");
+    }
+
+    #[tokio::test]
+    async fn test_write_capture_decode_strips_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let ts = chrono::Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let entry = make_entry(ts, 1);
+
+        let resp_body = base64::Engine::encode(
+            &base64::prelude::BASE64_STANDARD,
+            "event: message\ndata: {\"content\":\"hi\"}\n\n[DONE]",
+        );
+        let data = format!(r#"{{"req_body":"e30=","resp_body":"{}"}}"#, resp_body);
+
+        let cfg = make_config(dir.path().to_str().unwrap(), true, false);
+        let filename: Option<PathBuf> = Some(dir.path().join("2025-01-01T00-00_0001.json"));
+        write_capture(entry, data.as_bytes(), &cfg, &filename)
+            .await
+            .unwrap();
+
+        let content = tokio::fs::read_to_string(filename.as_ref().unwrap())
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(json["capture"]["resp_body"][0]["content"], "hi");
+    }
+
+    #[tokio::test]
+    async fn test_write_capture_decode_missing_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let ts = chrono::Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let entry = make_entry(ts, 1);
+
+        let data = r#"{"other":"value"}"#;
+        let cfg = make_config(dir.path().to_str().unwrap(), true, false);
+        let filename: Option<PathBuf> = Some(dir.path().join("2025-01-01T00-00_0001.json"));
+        let res = write_capture(entry, data.as_bytes(), &cfg, &filename).await;
+        assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_write_capture_decode_invalid_base64() {
+        let dir = tempfile::tempdir().unwrap();
+        let ts = chrono::Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let entry = make_entry(ts, 1);
+
+        let data = r#"{"req_body":"!!!invalid","resp_body":"e30="}"#;
+        let cfg = make_config(dir.path().to_str().unwrap(), true, false);
+        let filename: Option<PathBuf> = Some(dir.path().join("2025-01-01T00-00_0001.json"));
+        let res = write_capture(entry, data.as_bytes(), &cfg, &filename).await;
+        assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_write_capture_decode_invalid_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let ts = chrono::Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let entry = make_entry(ts, 1);
+
+        let bad_json = base64::Engine::encode(&base64::prelude::BASE64_STANDARD, "not json at all");
+        let data = format!(r#"{{"req_body":"{}","resp_body":"e30="}}"#, bad_json);
+        let cfg = make_config(dir.path().to_str().unwrap(), true, false);
+        let filename: Option<PathBuf> = Some(dir.path().join("2025-01-01T00-00_0001.json"));
+        let res = write_capture(entry, data.as_bytes(), &cfg, &filename).await;
+        assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_write_capture_decode_not_string() {
+        let dir = tempfile::tempdir().unwrap();
+        let ts = chrono::Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let entry = make_entry(ts, 1);
+
+        let data = r#"{"req_body":123,"resp_body":"e30="}"#;
+        let cfg = make_config(dir.path().to_str().unwrap(), true, false);
+        let filename: Option<PathBuf> = Some(dir.path().join("2025-01-01T00-00_0001.json"));
+        let res = write_capture(entry, data.as_bytes(), &cfg, &filename).await;
+        assert!(res.is_err());
+    }
+
+    // --- SSEBuffer error case tests ---
+
+    #[test]
+    fn test_sse_buffer_unexpected_empty_line() {
+        let mut buf = SSEBuffer::default();
+        let res = buf.process_chunk::<serde_json::Value>(b"\n");
+        assert!(res.len() == 1 && res[0].is_err());
+    }
+
+    #[test]
+    fn test_sse_buffer_unparseable_line() {
+        let mut buf = SSEBuffer::default();
+        let res = buf.process_chunk::<serde_json::Value>(b"event: message\ndata: {}\ngarbage\n");
+        let err = res.iter().find(|r| r.is_err());
+        assert!(err.is_some());
+    }
+
+    #[test]
+    fn test_sse_buffer_unexpected_event() {
+        let mut buf = SSEBuffer::default();
+        let res = buf.process_chunk::<serde_json::Value>(b"event: message\nevent: other\n");
+        let err = res.iter().find(|r| r.is_err());
+        assert!(err.is_some());
+    }
+
+    #[test]
+    fn test_sse_buffer_unexpected_data_state() {
+        let mut buf = SSEBuffer::default();
+        let res = buf.process_chunk::<serde_json::Value>(b"event: message\ndata: {}\ndata: more\n");
+        let err = res.iter().find(|r| r.is_err());
+        assert!(err.is_some());
+    }
+
+    #[test]
+    fn test_sse_buffer_unknown_key() {
+        let mut buf = SSEBuffer::default();
+        let res = buf.process_chunk::<serde_json::Value>(b"event: message\nfoo: bar\n");
+        let err = res.iter().find(|r| r.is_err());
+        assert!(err.is_some());
+    }
+
+    // --- fetch_capture with API key ---
+
+    #[tokio::test]
+    async fn test_fetch_capture_with_api_key() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://127.0.0.1:{}", addr.port());
+
+        let (auth_tx, mut auth_rx) = tokio::sync::mpsc::channel(1);
+
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap();
+                let req = std::str::from_utf8(&buf[..n]).unwrap();
+                let has_auth = req
+                    .to_lowercase()
+                    .contains("authorization: bearer secret-key");
+                let _ = auth_tx.send(has_auth).await;
+
+                let resp_body = r#"{"req_body":"e30=","resp_body":"e30="}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
+                    resp_body.len(),
+                    resp_body
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let data = fetch_capture(&base_url, "secret-key", 99).await.unwrap();
+        let has_auth = auth_rx.recv().await.unwrap();
+        assert!(has_auth, "Request should contain Authorization header");
+        let json: serde_json::Value = serde_json::from_slice(&data).unwrap();
+        assert_eq!(json["req_body"], "e30=");
+    }
+
+    #[tokio::test]
+    async fn test_fetch_capture_without_api_key() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://127.0.0.1:{}", addr.port());
+
+        let (auth_tx, mut auth_rx) = tokio::sync::mpsc::channel(1);
+
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap();
+                let req = std::str::from_utf8(&buf[..n]).unwrap();
+                let has_auth = req.to_lowercase().contains("authorization");
+                let _ = auth_tx.send(has_auth).await;
+
+                let resp_body = r#"{"req_body":"e30="}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
+                    resp_body.len(),
+                    resp_body
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let data = fetch_capture(&base_url, "", 99).await.unwrap();
+        let has_auth = auth_rx.recv().await.unwrap();
+        assert!(!has_auth, "Request should NOT contain Authorization header");
+        let json: serde_json::Value = serde_json::from_slice(&data).unwrap();
+        assert_eq!(json["req_body"], "e30=");
     }
 }
