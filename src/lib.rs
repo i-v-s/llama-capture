@@ -122,14 +122,34 @@ mod tests {
 
     // --- fetch_capture tests ---
 
-    async fn start_mock_server(handler: fn(tokio::net::TcpStream)) -> String {
+    async fn read_http_request(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+        let mut request = Vec::new();
+        let mut buf = [0u8; 1024];
+
+        loop {
+            let n = stream.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+
+            request.extend_from_slice(&buf[..n]);
+            if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+
+        request
+    }
+
+    async fn start_mock_server(response: &'static [u8]) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            while let Ok((stream, _)) = listener.accept().await {
-                let h = handler;
+            while let Ok((mut stream, _)) = listener.accept().await {
                 tokio::spawn(async move {
-                    h(stream);
+                    let _ = read_http_request(&mut stream).await;
+                    let _ = stream.write_all(response).await;
+                    let _ = stream.shutdown().await;
                 });
             }
         });
@@ -138,12 +158,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetch_capture_returns_json() {
-        let url = start_mock_server(|mut stream| {
-            let resp = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 20\r\n\r\n{\"id\":99,\"path\":\"/\"}";
-            tokio::spawn(async move {
-                let _ = stream.write_all(resp).await;
-            });
-        })
+        let url = start_mock_server(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 20\r\nConnection: close\r\n\r\n{\"id\":99,\"path\":\"/\"}",
+        )
         .await;
 
         let data = fetch_capture(&url, "", 99).await.unwrap();
@@ -152,12 +169,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetch_capture_error_on_non_200() {
-        let url = start_mock_server(|mut stream| {
-            let resp = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
-            tokio::spawn(async move {
-                let _ = stream.write_all(resp).await;
-            });
-        })
+        let url = start_mock_server(
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
         .await;
 
         let result = fetch_capture(&url, "", 1).await;
@@ -227,12 +241,9 @@ mod tests {
     #[tokio::test]
     async fn test_process_metrics_event_fetches_capture() {
         let dir = tempfile::tempdir().unwrap();
-        let url = start_mock_server(|mut stream| {
-            let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}";
-            tokio::spawn(async move {
-                let _ = stream.write_all(resp).await;
-            });
-        })
+        let url = start_mock_server(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+        )
         .await;
 
         let cfg = CaptureConfig {
@@ -282,12 +293,9 @@ mod tests {
     #[tokio::test]
     async fn test_process_metrics_event_skips_existing_file() {
         let dir = tempfile::tempdir().unwrap();
-        let url = start_mock_server(|mut stream| {
-            let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}";
-            tokio::spawn(async move {
-                let _ = stream.write_all(resp).await;
-            });
-        })
+        let url = start_mock_server(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+        )
         .await;
 
         let cfg = CaptureConfig {
@@ -333,12 +341,9 @@ mod tests {
     #[tokio::test]
     async fn test_run_sse_loop_processes_metrics() {
         let dir = tempfile::tempdir().unwrap();
-        let url = start_mock_server(|mut stream| {
-            let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}";
-            tokio::spawn(async move {
-                let _ = stream.write_all(resp).await;
-            });
-        })
+        let url = start_mock_server(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+        )
         .await;
 
         let cfg = CaptureConfig {
@@ -363,12 +368,9 @@ mod tests {
     #[tokio::test]
     async fn test_run_sse_loop_multiple_metrics_in_one_event() {
         let dir = tempfile::tempdir().unwrap();
-        let url = start_mock_server(|mut stream| {
-            let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}";
-            tokio::spawn(async move {
-                let _ = stream.write_all(resp).await;
-            });
-        })
+        let url = start_mock_server(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+        )
         .await;
 
         let cfg = CaptureConfig {
@@ -394,12 +396,9 @@ mod tests {
     #[tokio::test]
     async fn test_run_sse_loop_buffers_split_json_chunks() {
         let dir = tempfile::tempdir().unwrap();
-        let url = start_mock_server(|mut stream| {
-            let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}";
-            tokio::spawn(async move {
-                let _ = stream.write_all(resp).await;
-            });
-        })
+        let url = start_mock_server(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+        )
         .await;
 
         let cfg = CaptureConfig {
@@ -738,9 +737,8 @@ mod tests {
 
         tokio::spawn(async move {
             if let Ok((mut stream, _)) = listener.accept().await {
-                let mut buf = [0u8; 4096];
-                let n = stream.read(&mut buf).await.unwrap();
-                let req = std::str::from_utf8(&buf[..n]).unwrap();
+                let request = read_http_request(&mut stream).await;
+                let req = std::str::from_utf8(&request).unwrap();
                 let has_auth = req
                     .to_lowercase()
                     .contains("authorization: bearer secret-key");
@@ -748,11 +746,12 @@ mod tests {
 
                 let resp_body = r#"{"req_body":"e30=","resp_body":"e30="}"#;
                 let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",
                     resp_body.len(),
                     resp_body
                 );
                 let _ = stream.write_all(resp.as_bytes()).await;
+                let _ = stream.shutdown().await;
             }
         });
 
@@ -774,19 +773,19 @@ mod tests {
 
         tokio::spawn(async move {
             if let Ok((mut stream, _)) = listener.accept().await {
-                let mut buf = [0u8; 4096];
-                let n = stream.read(&mut buf).await.unwrap();
-                let req = std::str::from_utf8(&buf[..n]).unwrap();
+                let request = read_http_request(&mut stream).await;
+                let req = std::str::from_utf8(&request).unwrap();
                 let has_auth = req.to_lowercase().contains("authorization");
                 let _ = auth_tx.send(has_auth).await;
 
                 let resp_body = r#"{"req_body":"e30="}"#;
                 let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",
                     resp_body.len(),
                     resp_body
                 );
                 let _ = stream.write_all(resp.as_bytes()).await;
+                let _ = stream.shutdown().await;
             }
         });
 
