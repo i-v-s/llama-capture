@@ -211,3 +211,18 @@ Run clippy:
 ```sh
 cargo clippy --all-targets --all-features
 ```
+
+## Releases
+
+GitHub Actions creates a release when a tag matching `v*` is pushed:
+
+```sh
+git tag v0.1.5
+git push origin v0.1.5
+```
+
+You can also run the release workflow manually from GitHub Actions and provide
+an existing `v*` tag.
+
+The release workflow builds Linux, macOS, and Windows archives, attaches them to
+the GitHub Release, and publishes a `SHA256SUMS` file.

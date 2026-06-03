@@ -1,0 +1,117 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Git tag to release, for example v0.1.5"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  BIN_NAME: llama-capture
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive_ext: tar.gz
+          - name: macos-x86_64
+            os: macos-15-intel
+            target: x86_64-apple-darwin
+            archive_ext: tar.gz
+          - name: macos-aarch64
+            os: macos-15
+            target: aarch64-apple-darwin
+            archive_ext: tar.gz
+          - name: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive_ext: zip
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Install Rust toolchain
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package Unix archive
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          staging="${BIN_NAME}-${{ matrix.name }}"
+          mkdir "$staging"
+          cp "target/${{ matrix.target }}/release/${BIN_NAME}" "$staging/"
+          cp README.md "$staging/"
+          if [ -f LICENSE ]; then cp LICENSE "$staging/"; fi
+          tar -czf "${staging}.tar.gz" "$staging"
+
+      - name: Package Windows archive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $staging = "${env:BIN_NAME}-${{ matrix.name }}"
+          New-Item -ItemType Directory -Path $staging | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${env:BIN_NAME}.exe" "$staging/"
+          Copy-Item "README.md" "$staging/"
+          if (Test-Path "LICENSE") { Copy-Item "LICENSE" "$staging/" }
+          Compress-Archive -Path "$staging/*" -DestinationPath "${staging}.zip"
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BIN_NAME }}-${{ matrix.name }}
+          path: ${{ env.BIN_NAME }}-${{ matrix.name }}.${{ matrix.archive_ext }}
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download archives
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          files: dist/*
+          generate_release_notes: true
+          prerelease: ${{ contains(env.RELEASE_TAG, '-') }}
